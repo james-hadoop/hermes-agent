@@ -56,14 +56,18 @@ Usage:
 # this guard, hermes crashes on import and the user can't run
 # ``hermes update`` to recover.  Missing the bootstrap means UTF-8 stdio
 # setup is skipped on Windows — degraded, not broken.  POSIX is unaffected.
+import os
+import sys
+
+_PROJECT_ROOT_STR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT_STR not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT_STR)
+
+
 try:
     import hermes_bootstrap  # noqa: F401
 except ModuleNotFoundError:
     pass
-
-import os
-import sys
-
 
 def _set_process_title() -> None:
     """Set the process title to 'hermes' so tools like 'ps', 'top', and
@@ -320,8 +324,9 @@ def _require_tty(command_name: str) -> None:
 
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(PROJECT_ROOT))
+PROJECT_ROOT = Path(_PROJECT_ROOT_STR).resolve()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # ---------------------------------------------------------------------------

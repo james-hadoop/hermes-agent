@@ -14331,8 +14331,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         }
         style = PTStyle.from_dict(self._build_tui_style_dict())
         
-        # Create the application
-        app = Application(
+        app_kwargs = dict(
             layout=layout,
             key_bindings=kb,
             style=style,
@@ -14356,8 +14355,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # normal scrollback and is unaffected; only the managed chrome is
             # erased. Applies to every exit path (/exit, /quit, EOF, Ctrl+C).
             erase_when_done=True,
-            **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
+        if _STEADY_CURSOR is not None:
+            app_kwargs["cursor"] = _STEADY_CURSOR
+
+        # Create the application. Some Windows IDE consoles expose stdout but
+        # no Win32 screen buffer; prompt_toolkit's default Win32Output raises
+        # NoConsoleScreenBufferError there. Fall back to plain text output so
+        # direct script launches can still run and accept stdin.
+        plain_output_fallback = False
+        try:
+            app = Application(**app_kwargs)
+        except Exception as exc:
+            if exc.__class__.__name__ != "NoConsoleScreenBufferError":
+                raise
+            from prompt_toolkit.output.plain_text import PlainTextOutput
+
+            app_kwargs["output"] = PlainTextOutput(sys.stdout)
+            app = Application(**app_kwargs)
+            plain_output_fallback = True
         _disable_prompt_toolkit_cpr_warning(app)
         self._app = app  # Store reference for clarify_callback
 
@@ -14796,7 +14812,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Run the application with patch_stdout for proper output handling
         try:
-            with patch_stdout():
+            if plain_output_fallback:
+                from contextlib import nullcontext
+
+                stdout_patch_context = nullcontext()
+            else:
+                stdout_patch_context = patch_stdout()
+            with stdout_patch_context:
                 # Set the custom handler on prompt_toolkit's event loop
                 try:
                     import asyncio as _aio
@@ -14808,12 +14830,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     pass  # No running loop -- nothing to patch
                 except Exception:
                     pass
-                # The app enables focus reporting + mouse tracking; record that
-                # so _run_cleanup resets them on exit (#36823).
-                _mark_tui_input_modes_active()
-                # Drive the petdex mascot animation (no-op when no pet enabled).
-                self._pet_start_anim()
-                app.run()
+                if plain_output_fallback:
+                    while not self._should_exit:
+                        try:
+                            user_input = input("> ")
+                        except EOFError:
+                            break
+                        if not user_input.strip():
+                            continue
+                        if user_input.strip().startswith("/"):
+                            if not self.process_command(user_input):
+                                break
+                        else:
+                            self.chat(user_input)
+                else:
+                    # The app enables focus reporting + mouse tracking; record that
+                    # so _run_cleanup resets them on exit (#36823).
+                    _mark_tui_input_modes_active()
+                    # Drive the petdex mascot animation (no-op when no pet enabled).
+                    self._pet_start_anim()
+                    app.run()
         except (EOFError, KeyboardInterrupt, BrokenPipeError):
             pass
         except (KeyError, OSError) as _stdin_err:
