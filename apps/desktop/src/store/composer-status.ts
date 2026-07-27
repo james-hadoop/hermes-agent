@@ -1,9 +1,11 @@
 import { atom, computed } from 'nanostores'
 
 import { translateNow } from '@/i18n'
+import { stableArray } from '@/lib/stable-array'
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
 import { $gateway } from './gateway'
+import { $goalsBySession, type GoalStatus } from './goals'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
 import { $sessionStates } from './session-states'
@@ -12,13 +14,15 @@ import { $todosBySession } from './todos'
 
 /** Composer status stack feed — merged todos, subagents, background per session. */
 export type StatusItemState = 'done' | 'failed' | 'running'
-export type StatusItemType = 'background' | 'subagent' | 'todo'
+export type StatusItemType = 'background' | 'goal' | 'subagent' | 'todo'
 
 export interface ComposerStatusItem {
   /** background: non-zero exit shown inline when failed. */
   exitCode?: number
   /** subagent: active tool label shown on the right. */
   currentTool?: string
+  /** goal: active | paused | waiting | done. */
+  goalStatus?: GoalStatus
   id: string
   /** background process: captured stdout/stderr tail for the inline viewer. */
   output?: string
@@ -44,22 +48,24 @@ export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem
 // $backgroundStatusBySession is keyed by RUNTIME session id (gateway events
 // and process.list both speak that); the sidebar row knows only the STORED id.
 // $sessionStates bridges the two: runtime id → state.storedSessionId.
+// Perf: recomputes on every $sessionStates change (message deltas, tens/sec),
+// but the background-running set rarely moves. `stableArray` keeps the prior
+// reference when unchanged so rows reading this don't re-render per token.
+let backgroundRunningIds: readonly string[] = []
 export const $backgroundRunningSessionIds = computed([$backgroundStatusBySession, $sessionStates], (bg, states) => {
   const ids = new Set<string>()
 
   for (const [runtimeId, items] of Object.entries(bg)) {
-    if (!items.some(i => i.state === 'running')) {
-      continue
-    }
+    if (items.some(i => i.state === 'running')) {
+      const storedId = states[runtimeId]?.storedSessionId
 
-    const storedId = states[runtimeId]?.storedSessionId
-
-    if (storedId) {
-      ids.add(storedId)
+      if (storedId) {
+        ids.add(storedId)
+      }
     }
   }
 
-  return [...ids]
+  return (backgroundRunningIds = stableArray(backgroundRunningIds, [...ids]))
 })
 
 // Rows the user X-ed away. The registry keeps finished processes around for a
@@ -140,10 +146,19 @@ const todoToItem = (t: TodoItem): ComposerStatusItem => ({
   type: 'todo'
 })
 
+const goalToItem = (goal: { detail?: string; status: GoalStatus; title: string }): ComposerStatusItem => ({
+  currentTool: goal.detail,
+  goalStatus: goal.status,
+  id: 'goal:standing',
+  state: goal.status === 'active' || goal.status === 'waiting' ? 'running' : 'done',
+  title: goal.title,
+  type: 'goal'
+})
+
 // The single thing the stack reads: a typed, merged item list per session.
 export const $statusItemsBySession = computed(
-  [$subagentsBySession, $backgroundStatusBySession, $todosBySession],
-  (subs, background, todos) => {
+  [$goalsBySession, $subagentsBySession, $backgroundStatusBySession, $todosBySession],
+  (goals, subs, background, todos) => {
     const out: Record<string, ComposerStatusItem[]> = {}
 
     const push = (sid: string, items: ComposerStatusItem[]) => {
@@ -154,6 +169,10 @@ export const $statusItemsBySession = computed(
 
     for (const [sid, list] of Object.entries(todos)) {
       push(sid, list.map(todoToItem))
+    }
+
+    for (const [sid, goal] of Object.entries(goals)) {
+      push(sid, [goalToItem(goal)])
     }
 
     for (const [sid, list] of Object.entries(subs)) {
@@ -169,7 +188,7 @@ export const $statusItemsBySession = computed(
 )
 
 // Fixed render order for the groups in the stack (top → bottom, above queue).
-const TYPE_ORDER: readonly StatusItemType[] = ['todo', 'subagent', 'background']
+const TYPE_ORDER: readonly StatusItemType[] = ['goal', 'todo', 'subagent', 'background']
 
 export interface StatusGroup {
   items: ComposerStatusItem[]

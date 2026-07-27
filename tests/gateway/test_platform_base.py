@@ -21,6 +21,22 @@ from gateway.platforms.base import (
 )
 
 
+def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
+    """Encrypted Bitwarden cache is covered by the media credential guard."""
+    import gateway.platforms.base as base
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    path = hermes_home / "cache" / "bws_cache.enc.json"
+    path.parent.mkdir()
+    path.write_text("encrypted-secret-cache")
+
+    assert path in base._media_delivery_denied_paths()
+    assert base.validate_media_delivery_path(str(path)) is None
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 
@@ -385,6 +401,31 @@ class TestExtractMedia:
         assert media == [("/tmp/Jane Doe/speech.flac", False)]
         assert cleaned == ""
 
+    def test_duplicate_media_tags_are_deduplicated(self):
+        content = "MEDIA:/tmp/test.png\nMEDIA:/tmp/test.png\nMEDIA:/tmp/other.png"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/tmp/test.png", False),
+            ("/tmp/other.png", False),
+        ]
+        assert cleaned == ""
+
+    def test_duplicate_media_tags_dedup_preserves_first_occurrence_order(self):
+        content = "MEDIA:/tmp/a.png\nMEDIA:/tmp/b.png\nMEDIA:/tmp/a.png\nMEDIA:/tmp/c.png"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == [
+            ("/tmp/a.png", False),
+            ("/tmp/b.png", False),
+            ("/tmp/c.png", False),
+        ]
+
+    def test_dedup_uses_expanded_path_so_tilde_and_absolute_collapse(self):
+        import os
+        home = os.path.expanduser("~")
+        content = f"MEDIA:~/foo.png\nMEDIA:{home}/foo.png"
+        media, _ = BasePlatformAdapter.extract_media(content)
+        assert media == [(f"{home}/foo.png", False)]
+
     def test_as_document_directive_stripped_from_cleaned_text(self):
         """[[as_document]] is a routing directive — strip it from
         user-visible text just like [[audio_as_voice]]. Callers detect the
@@ -512,6 +553,51 @@ class TestExtractMedia:
         media, cleaned = BasePlatformAdapter.extract_media(content)
         assert [p for p, _ in media] == ["/r/a.png"]
         assert "`MEDIA:/ex/b.png`" in cleaned
+
+    # --- Markdown emphasis wrapping tolerance ---
+    # Models routinely present a file as **MEDIA:/path** / *MEDIA:/path* /
+    # _MEDIA:/path_. The old pattern only tolerated a single quote/backtick, so
+    # the emphasis prevented the match and the file was silently never
+    # delivered (the literal MEDIA: text leaked into the chat instead).
+
+    def test_media_bold_wrapped_extracted(self):
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "**MEDIA:/home/u/report.pptx**"
+        )
+        assert media == [("/home/u/report.pptx", False)]
+        assert "MEDIA:" not in cleaned
+
+    def test_media_italic_asterisk_extracted(self):
+        media, _ = BasePlatformAdapter.extract_media("*MEDIA:/home/u/report.pdf*")
+        assert media == [("/home/u/report.pdf", False)]
+
+    def test_media_italic_underscore_extracted(self):
+        media, _ = BasePlatformAdapter.extract_media("_MEDIA:/home/u/report.pdf_")
+        assert media == [("/home/u/report.pdf", False)]
+
+    def test_media_bold_mid_prose_extracted_and_stripped(self):
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "Voici votre fichier **MEDIA:/tmp/r.pdf** bonne lecture"
+        )
+        assert media == [("/tmp/r.pdf", False)]
+        assert "MEDIA:" not in cleaned
+        assert "bonne lecture" in cleaned
+
+    def test_media_bold_wrapped_html_extracted(self):
+        # .html is a recognised extension; emphasis was the only blocker.
+        media, _ = BasePlatformAdapter.extract_media("**MEDIA:/srv/page.html**")
+        assert media == [("/srv/page.html", False)]
+
+    def test_media_underscore_in_filename_unaffected(self):
+        # Emphasis tolerance must not eat a legitimate '_' inside the path.
+        media, _ = BasePlatformAdapter.extract_media("MEDIA:/tmp/my_report_v2.pptx")
+        assert media == [("/tmp/my_report_v2.pptx", False)]
+
+    def test_media_bold_relative_path_still_ignored(self):
+        # The absolute-path anchor must still reject relative paths even when
+        # wrapped in emphasis.
+        media, _ = BasePlatformAdapter.extract_media("**MEDIA:report.html**")
+        assert media == []
 
 
 class TestMediaInsideSerializedJson:
@@ -1602,6 +1688,76 @@ class TestTruncateMessage:
         chunks = adapter.truncate_message(msg, max_length=200)
         assert "(1/" in chunks[0]
         assert f"({len(chunks)}/{len(chunks)})" in chunks[-1]
+
+    @staticmethod
+    def _truncate_with_timeout(content, max_length, *, len_fn=None, timeout=3.0):
+        """Run truncate_message on a worker thread; fail if it doesn't return.
+
+        Guards against the regression where a pathologically small max_length
+        made the split loop never consume any input and spin forever.
+        """
+        import threading
+
+        box: dict = {}
+
+        def _run():
+            box["result"] = BasePlatformAdapter.truncate_message(
+                content, max_length, len_fn=len_fn
+            )
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        assert not t.is_alive(), (
+            f"truncate_message hung (infinite loop) for max_length={max_length}"
+        )
+        return box["result"]
+
+    def test_pathological_small_max_length_terminates(self):
+        # max_length 0 and 1 previously drove the split loop into an unbounded
+        # hang (headroom -> 0, split_at -> 0, remaining never shrinks). It must
+        # terminate and preserve every character across the chunks.
+        import re
+
+        for max_length in (0, 1, 2):
+            chunks = self._truncate_with_timeout("abcdefghij", max_length)
+            assert chunks, f"no chunks for max_length={max_length}"
+            reassembled = "".join(
+                re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks
+            )
+            for ch in "abcdefghij":
+                assert ch in reassembled, f"char {ch!r} lost at max_length={max_length}"
+
+    def test_pathological_small_max_length_utf16_terminates(self):
+        # Under utf16_len (Telegram), a surrogate-pair emoji is 2 units wide, so
+        # a budget below that maps to zero codepoints — the same stall vector.
+        from gateway.platforms.base import utf16_len
+
+        chunks = self._truncate_with_timeout("😀😀😀😀😀", 1, len_fn=utf16_len)
+        assert chunks
+        assert "😀" in "".join(chunks)
+
+    def test_sub_codepoint_budget_emits_whole_codepoints_without_data_loss(self):
+        """Length contract for a budget too small to fit one codepoint.
+
+        A codepoint is indivisible, so with max_length=1 and utf16_len a 2-unit
+        emoji cannot fit — the loop emits it whole rather than dropping it or
+        spinning. The documented, intentional consequence is that such a chunk
+        EXCEEDS max_length by that one codepoint; in return every codepoint is
+        preserved (no data loss) and the call terminates.
+        """
+        import re
+
+        from gateway.platforms.base import utf16_len
+
+        chunks = self._truncate_with_timeout("😀😀😀", 1, len_fn=utf16_len)
+        assert chunks
+        bodies = [re.sub(r"\s*\(\d+/\d+\)$", "", c) for c in chunks]
+        # No data loss: all three emojis survive across the chunks.
+        assert "".join(bodies).count("😀") == 3
+        # Contract: a chunk carrying a 2-unit emoji necessarily exceeds the
+        # 1-unit budget — assert that explicitly so the behavior is pinned.
+        assert any(utf16_len(b) > 1 for b in bodies)
 
     def test_code_block_first_chunk_closed(self):
         adapter = self._adapter()
