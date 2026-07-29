@@ -142,6 +142,140 @@ class CLICommandsMixin:
         else:
             print(f"  ❌ {result['error']}")
 
+    def _handle_diff_command(self, command: str):
+        """Handle /diff — show git changes in the working directory.
+
+        Syntax:
+            /diff                  — unstaged changes + untracked files
+            /diff staged           — staged changes (git diff --cached)
+            /diff all              — staged + unstaged + untracked (vs HEAD)
+            /diff session          — everything Hermes changed (checkpoint baseline)
+            /diff [mode] --stat    — summary only (changed files + counts)
+            /diff [mode] <path...> — restrict to specific paths
+        """
+        import shlex
+
+        try:
+            parts = shlex.split(command)[1:]  # preserves quoted paths
+        except ValueError:
+            parts = command.split()[1:]
+
+        stat_only = False
+        mode = "working"
+        paths: list[str] = []
+        for arg in parts:
+            low = arg.lower()
+            if low in ("--stat", "stat"):
+                stat_only = True
+            elif low in ("staged", "--staged", "cached", "--cached"):
+                mode = "staged"
+            elif low in ("all", "--all", "head"):
+                mode = "all"
+            elif low == "session":
+                mode = "session"
+            else:
+                paths.append(arg)
+
+        cwd = os.getenv("TERMINAL_CWD", os.getcwd())
+
+        if mode == "session":
+            self._print_session_diff(cwd, stat_only)
+            return
+
+        from tools.working_diff import collect_working_diff
+
+        result = collect_working_diff(cwd, mode=mode, paths=paths or None)
+        if not result.get("success"):
+            print(f"  {result.get('error', 'Could not generate diff')}")
+            return
+
+        stat = result.get("stat", "")
+        diff = result.get("diff", "")
+        untracked = result.get("untracked", [])
+        if result.get("empty") or (not stat and not diff and not untracked):
+            print("  No changes.")
+            return
+
+        label = {"working": "Unstaged", "staged": "Staged", "all": "All (vs HEAD)"}[mode]
+        if stat:
+            print(f"\n  {label}:")
+            self._print_diff_text(stat)
+        if untracked and mode in ("working", "all"):
+            print("\n  Untracked:")
+            for rel in untracked[:20]:
+                print(f"    + {rel}")
+            if len(untracked) > 20:
+                print(f"    ... and {len(untracked) - 20} more")
+        if stat_only or not diff:
+            return
+
+        diff_lines = diff.splitlines()
+        print("")
+        if len(diff_lines) > 400:
+            self._print_diff_text("\n".join(diff_lines[:400]))
+            print(
+                f"\n  ... ({len(diff_lines) - 400} more lines — "
+                "run /diff --stat for a summary)"
+            )
+        else:
+            self._print_diff_text(diff)
+
+    def _print_session_diff(self, cwd: str, stat_only: bool):
+        """Print the cumulative checkpoint-baseline diff (/diff session)."""
+        if not hasattr(self, 'agent') or not self.agent:
+            print("  No active agent session.")
+            return
+
+        mgr = self.agent._checkpoint_mgr
+        if not mgr.enabled:
+            print("  Checkpoints are not enabled, so there's no session baseline.")
+            print("  Enable with: hermes --checkpoints")
+            print("  Or in config.yaml: checkpoints: { enabled: true }")
+            print("  (Plain /diff still works — it uses git directly.)")
+            return
+
+        result = mgr.session_diff(cwd)
+        if not result.get("success"):
+            print(f"  {result.get('error', 'Could not generate diff')}")
+            return
+
+        stat = result.get("stat", "")
+        diff = result.get("diff", "")
+        if result.get("empty") or (not stat and not diff):
+            print("  No changes — Hermes hasn't edited any files here yet.")
+            return
+
+        if stat:
+            self._print_diff_text(f"\n{stat}")
+        if stat_only or not diff:
+            return
+        diff_lines = diff.splitlines()
+        print("")
+        if len(diff_lines) > 400:
+            self._print_diff_text("\n".join(diff_lines[:400]))
+            print(
+                f"\n  ... ({len(diff_lines) - 400} more lines — "
+                "run /diff session --stat for a summary)"
+            )
+        else:
+            self._print_diff_text(diff)
+
+    def _print_diff_text(self, text: str) -> None:
+        """Render diff/stat text with color when a rich console is present.
+
+        Falls back to plain print when the console isn't available (e.g. unit
+        tests instantiating the mixin standalone).
+        """
+        console = getattr(self, "console", None)
+        if console is not None:
+            try:
+                from cli import _rich_text_from_ansi
+                console.print(_rich_text_from_ansi(text))
+                return
+            except Exception:
+                pass
+        print(text)
+
     def _handle_snapshot_command(self, command: str):
         """Handle /snapshot — lightweight state snapshots for Hermes config/state.
 
@@ -425,8 +559,30 @@ class CLICommandsMixin:
             return
 
         try:
+            from hermes_cli.clipboard import (
+                is_remote_shell_session,
+                write_clipboard_text,
+            )
+            if is_remote_shell_session():
+                # Over SSH, native tools would write the REMOTE clipboard
+                # (or an X-forwarded one) — OSC 52 reaches the terminal
+                # the user is actually sitting at. Fixes #31528.
+                self._write_osc52_clipboard(text)
+                _cprint(
+                    f"  Copied assistant response #{idx + 1} via OSC 52 "
+                    "(terminal support required)"
+                )
+                return
+            if write_clipboard_text(text):
+                _cprint(f"  Copied assistant response #{idx + 1} to clipboard")
+                return
+            # Native tools unavailable/failed — fall back to OSC 52 so
+            # SSH/tmux sessions can still copy via the terminal emulator.
             self._write_osc52_clipboard(text)
-            _cprint(f"  Copied assistant response #{idx + 1} to clipboard")
+            _cprint(
+                f"  Copied assistant response #{idx + 1} via OSC 52 "
+                "(terminal support required)"
+            )
         except Exception as e:
             _cprint(f"  Clipboard copy failed: {e}")
 
@@ -537,11 +693,11 @@ class CLICommandsMixin:
 
     def _handle_profile_command(self):
         """Display active profile name and home directory."""
-        from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.slash_exec import CommandContext, execute_command
 
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        reply = execute_command("profile", CommandContext(surface="cli"))
+        profile_name = reply.data["profile"]
+        display = reply.data["home"]
 
         print()
         print(f"  Profile: {profile_name}")
@@ -1864,20 +2020,21 @@ class CLICommandsMixin:
         of their session. Bundles are loaded via ``/<bundle-name>``.
         """
         from cli import ChatConsole, _BOLD, _DIM, _RST, _accent_hex, _cprint
-        try:
-            from agent.skill_bundles import list_bundles, _bundles_dir
-        except Exception as exc:
-            _cprint(f"\033[1;31mBundle subsystem unavailable: {exc}{_RST}")
+        from hermes_cli.slash_exec import CommandContext, execute_command
+
+        reply = execute_command("bundles", CommandContext(surface="cli"))
+        if "error" in reply.data:
+            _cprint(f"\033[1;31mBundle subsystem unavailable: {reply.data['error']}{_RST}")
             return
 
-        bundles = list_bundles()
+        bundles = reply.data["bundles"]
         if not bundles:
             _cprint("  No skill bundles installed.")
             _cprint(
                 f"  {_DIM}Create one with: hermes bundles create "
                 f"<name> --skill <s1> --skill <s2>{_RST}"
             )
-            _cprint(f"  {_DIM}Directory: {_bundles_dir()}{_RST}")
+            _cprint(f"  {_DIM}Directory: {reply.data['dir']}{_RST}")
             return
 
         _cprint(f"\n  ▣ {_BOLD}Skill Bundles{_RST} ({len(bundles)} installed):")
@@ -2644,6 +2801,16 @@ class CLICommandsMixin:
         except Exception:
             pass
 
+    def _handle_approvals_command(self, cmd_original: str) -> None:
+        """Show or persist the profile-wide dangerous-command approval mode."""
+        from cli import _cprint
+        from hermes_cli.approval_mode import run_approval_mode_command
+
+        parts = (cmd_original or "").strip().split(None, 1)
+        requested = parts[1] if len(parts) > 1 else None
+        result = run_approval_mode_command(requested)
+        _cprint(f"  {result.message}")
+
     def _handle_footer_command(self, cmd_original: str) -> None:
         """Toggle or inspect ``display.runtime_footer.enabled`` from the CLI.
 
@@ -3045,3 +3212,49 @@ class CLICommandsMixin:
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
             _cprint("Usage: /voice [on|off|tts|status]")
+
+    def _handle_wake_command(self, command: str):
+        """Handle /wake [on|off|status] — the 'Hey Hermes' hotword listener.
+
+        The toggle IS the config: an explicit on/off (or bare toggle) also
+        writes ``wake_word.enabled`` to config.yaml so the choice persists
+        across sessions. Startup auto-arm (_maybe_start_wake_word) only reads.
+        """
+        from cli import _cprint
+        parts = command.strip().split(maxsplit=1)
+        subcommand = parts[1].lower().strip() if len(parts) > 1 else ""
+
+        if subcommand == "on":
+            if self._start_wake_word_listener(announce=True):
+                self._persist_wake_word_enabled(True)
+        elif subcommand == "off":
+            self._stop_wake_word_listener(announce=True)
+            self._persist_wake_word_enabled(False)
+        elif subcommand in ("", "status"):
+            if subcommand == "":
+                # Bare /wake toggles.
+                if getattr(self, "_wake_word_active", False):
+                    self._stop_wake_word_listener(announce=True)
+                    self._persist_wake_word_enabled(False)
+                elif self._start_wake_word_listener(announce=True):
+                    self._persist_wake_word_enabled(True)
+            else:
+                self._show_wake_word_status()
+        else:
+            _cprint(f"Unknown wake subcommand: {subcommand}")
+            _cprint("Usage: /wake [on|off|status]")
+
+    def _persist_wake_word_enabled(self, enabled: bool):
+        """Save ``wake_word.enabled`` so the /wake toggle sticks for future sessions."""
+        from cli import _cprint, _DIM, _RST, save_config_value
+
+        try:
+            from tools.wake_word import load_wake_word_config
+
+            if bool(load_wake_word_config().get("enabled")) == enabled:
+                return  # already persisted — don't rewrite config or re-announce
+        except Exception:
+            pass
+        if save_config_value("wake_word.enabled", enabled):
+            _cprint(f"{_DIM}Wake word {'enabled' if enabled else 'disabled'} in config "
+                    f"(wake_word.enabled: {str(enabled).lower()}).{_RST}")
