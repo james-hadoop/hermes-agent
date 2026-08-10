@@ -14853,14 +14853,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else None
         )
 
-        # Create the application
-        app = Application(
+        app_kwargs = dict(
             layout=layout,
             key_bindings=kb,
             style=style,
             full_screen=False,
             mouse_support=False,
-            **({"output": _cpr_disabled_output} if _cpr_disabled_output is not None else {}),
             # Read from display.cli_refresh_interval (default 0 = disabled).
             # When non-zero, prompt_toolkit redraws the UI on this cadence
             # during idle, keeping wall-clock status-bar read-outs ticking.
@@ -14880,6 +14878,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             # erased. Applies to every exit path (/exit, /quit, EOF, Ctrl+C).
             erase_when_done=True,
         )
+        if _cpr_disabled_output is not None:
+            app_kwargs["output"] = _cpr_disabled_output
         if _STEADY_CURSOR is not None:
             app_kwargs["cursor"] = _STEADY_CURSOR
 
