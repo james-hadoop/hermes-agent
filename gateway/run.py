@@ -700,6 +700,15 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     text = _sanitize_surrogates(str(text))
 
+    # Some OpenAI-compatible providers leak their exact end-of-sequence control token into
+    # ``final_response`` even though finish_reason is already ``stop``.  It is transport metadata,
+    # not an assistant message; without filtering, chat adapters send a literal ``<|eos|>`` bubble.
+    # Reuse the MEDIA boundary's exact, terminal-only recognizer (#111046 / #111348): examples
+    # mentioning the token mid-response and non-exact variants remain byte-identical.
+    _eos_start = _terminal_sentinel_start(text)
+    if _eos_start >= 0:
+        text = text[:_eos_start].rstrip()
+
     # Cancellation metadata, not prose; ACP/TUI already suppress this sentinel, chat surfaces should too.
     # See #7921.
     if str(text).strip().startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
@@ -2157,6 +2166,7 @@ from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
+    _terminal_sentinel_start,
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.restart import (
@@ -3266,10 +3276,10 @@ _AUTO_RESET_CONTEXT_NOTES = {
 
 
 def _write_runtime_status_quiet(**fields: Any) -> None:
-    """Best-effort ``gateway_state.json`` write; status persistence must never abort the caller."""
+    """Best-effort status publication; persistence must never abort or block the caller."""
     try:
-        from gateway.status import write_runtime_status
-        write_runtime_status(**fields)
+        from gateway.status import publish_runtime_status
+        publish_runtime_status(**fields)
     except Exception:
         pass
 
@@ -3477,6 +3487,11 @@ class GatewayRunner(
         self._busy_input_modes_by_profile: Dict[str, str] = {}
         self._busy_text_modes_by_profile: Dict[str, str] = {}
         self._restart_drain_timeout = self._load_restart_drain_timeout()
+        # Live launchd ``ExitTimeOut`` for this job (None when not launchd-owned). Read once at
+        # boot — launchd fixes it at load — and applied only to signal-driven stops, which are the
+        # only stops launchd times. See _load_launchd_exit_timeout().
+        self._stop_requested_by_signal = False
+        self._launchd_exit_timeout_s = self._load_launchd_exit_timeout(self._restart_drain_timeout)
         self._restart_after_turn_timeout = self._load_restart_after_turn_timeout()
         self._cron_drain_timeout = self._load_cron_drain_timeout()
         self._signal_interrupt_grace_timeout = self._load_signal_interrupt_grace_timeout()
@@ -5090,6 +5105,12 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
 
             _best_effort(_log_context, "format_context_for_log failed: %s")
             _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
+        if not planned_takeover:
+            # Supervisor/operator SIGNAL stop (bootout, kickstart -k, systemd, s6, bare kill) — the
+            # only kind launchd times with ExitTimeOut. In-band SIGUSR1 restarts never pass through
+            # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
+            # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
+            runner._stop_requested_by_signal = True
         asyncio.create_task(runner.stop())
     return shutdown_signal_handler
 

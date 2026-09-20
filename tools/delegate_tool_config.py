@@ -333,8 +333,10 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         provider, api_mode = "anthropic", "anthropic_messages"
     elif "api.kimi.com/coding" in base_lower:
         api_mode = "anthropic_messages"
-    # Explicit delegation.api_mode always wins over the URL heuristic.
-    if v["api_mode"] in _EXPLICIT_API_MODES:
+    # Explicit delegation.api_mode always wins over the URL heuristic; a provider plugin's
+    # registered dialect counts as explicit.
+    from agent.transports import registered_api_modes
+    if v["api_mode"] in _EXPLICIT_API_MODES or (v["api_mode"] and v["api_mode"] in registered_api_modes()):
         api_mode = v["api_mode"]
 
     # Preserve the configured provider's request personality on an explicit endpoint.
@@ -540,8 +542,11 @@ def _resolve_child_runtime(
     # transport would run the child somewhere the user explicitly routed it away from. Normally unreachable
     # via delegate_task, which pre-validates the command in _resolve_delegation_credentials.
     if override_acp_command:
-        # Forced ACP transport requires provider copilot-acp for run_agent to init the client.
-        effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
+        from providers import get_provider_profile
+        profile = get_provider_profile(effective_provider or "")
+        # A generic process command does not imply the legacy ACP protocol.
+        if profile is None or profile.auth_type != "external_process":
+            effective_provider, effective_api_mode = "copilot-acp", "chat_completions"
 
     # Reasoning: delegation.reasoning_effort > parent. Keep the raw value — a
     # YAML ``false`` must disable thinking, not coerce to "" and inherit.
