@@ -735,11 +735,7 @@ export function carryForwardFailedProfileSessions(
   for (const session of previous) {
     // A hidden row (canonical Bot Chat) is LISTED-NEVER by design: the
     // failed-slice carry must not ride it back into the sidebar (#113273).
-    if (
-      session.hidden ||
-      !failed.has(sidebarProfileKey(session)) ||
-      incomingIds.has(sessionListIdentity(session))
-    ) {
+    if (session.hidden || !failed.has(sidebarProfileKey(session)) || incomingIds.has(sessionListIdentity(session))) {
       continue
     }
 
@@ -933,6 +929,11 @@ export interface ProfileUsage {
 }
 
 export const $sessionProfilesUsage = atom<Record<string, ProfileUsage>>({})
+
+/** Profiles whose state.db the backend reports as structurally corrupt (the list
+ *  endpoints' `storage` map, #72046). An empty or partial list for one of these
+ *  is a damaged store, not deleted history, and the sidebar says so. */
+export const $corruptSessionStores = atom<string[]>([])
 export const $sessionsLoading = atom(true)
 export const $activeSessionId = atom<string | null>(null)
 export const $selectedStoredSessionId = atom<string | null>(null)
@@ -1300,6 +1301,20 @@ export const setSessionProfilesTruncated = (next: Updater<Record<string, boolean
 export const setSessionProfilesUsage = (next: Updater<Record<string, ProfileUsage>>) =>
   updateAtom($sessionProfilesUsage, next)
 export const setSessionsLoading = (next: Updater<boolean>) => updateAtom($sessionsLoading, next)
+
+/** Publish the corrupt-store profiles from one sidebar refresh; identity-stable when unchanged. */
+export function setCorruptSessionStores(storage: Record<string, string> | undefined) {
+  const next = Object.keys(storage ?? {})
+    .filter(profile => storage?.[profile] === 'corrupt')
+    .sort()
+
+  const prev = $corruptSessionStores.get()
+
+  if (prev.length !== next.length || prev.some((profile, i) => profile !== next[i])) {
+    $corruptSessionStores.set(next)
+  }
+}
+
 export const setActiveSessionId = (next: Updater<string | null>) => updateAtom($activeSessionId, next)
 export const setActiveSessionStoredIdRotation = (next: Updater<ActiveSessionStoredIdRotation | null>) =>
   updateAtom($activeSessionStoredIdRotation, next)

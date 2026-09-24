@@ -336,9 +336,10 @@ def _check_run_auth(self, request: "web.Request", *, permission: str, _api_serve
 def _owner_alive(owner_pid: int, owner_started: int) -> bool:
     """True when the recorded owner pid still exists and is the same process incarnation."""
     try:
-        from gateway.status import _pid_exists, get_process_start_time
+        from gateway.status import _pid_exists, get_process_start_time, start_time_fingerprints_match
         return owner_pid > 0 and bool(_pid_exists(owner_pid)) and (
-            not owner_started or int(get_process_start_time(owner_pid) or 0) == owner_started)
+            not owner_started
+            or start_time_fingerprints_match(owner_started, get_process_start_time(owner_pid) or 0))
     except Exception:
         return False
 
@@ -392,7 +393,7 @@ def _resolve_conversation_history(
             logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
     stored_session_id = None
     if not conversation_history and previous_response_id:
-        stored = self._response_store.get(previous_response_id)
+        stored = self._current_response_store().get(previous_response_id)
         if stored:
             conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
@@ -779,6 +780,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
+            self._memory_sessions.checkin(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
             if run.declared_selected:
                 self._bind_declared_conversation(
