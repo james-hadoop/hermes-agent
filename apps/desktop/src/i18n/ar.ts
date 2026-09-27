@@ -734,7 +734,7 @@ export const ar = defineLocale({
       toursDesc:
         'دع Hermes يرشدك في التطبيق مع إبراز كل خطوة. تُعطّل الجولات تلقائيًا بعد أول 30 يومًا من الاستخدام، ويمكنك تفعيلها مجددًا.',
       composerPopoutTitle: 'محرر عائم',
-      composerPopoutDesc: 'السماح بسحب محرر الرسائل خارج موضعه. عطّل هذا الخيار لإبقائه مثبتًا في الأسفل.',
+      composerPopoutDesc: 'السماح بسحب محرر الرسائل خارج موضعه. عند إيقاف الخيار، يبقى مثبتًا في الأسفل.',
       fileBrowserTitle: 'مستعرض الملفات',
       fileBrowserDesc: 'عرض مستعرض الملفات بجانب المحادثة عند فتح مساحة عمل. يغيّر زر شريط العنوان هذا الخيار أيضًا.',
       vibeHeartsTitle: 'قلوب المزاج',
@@ -1834,6 +1834,8 @@ export const ar = defineLocale({
     skillsLabel: 'المهارات',
     notSet: 'غير مضبوط',
     soulDesc: 'الموجّه (prompt) النظامي وتعليمات الشخصية المضمّنة في هذا الملف الشخصي.',
+    soulMissing:
+      'لا يوجد ملف SOUL.md لهذا الملف الشخصي بعد. أضف التعليمات أدناه واحفظ لإنشائه. تُدار إعدادات الشخصية في config.yaml بشكل منفصل.',
     soulOptional: 'اختياري',
     soulPlaceholder: mode =>
       `الموجّه (prompt) النظامي / الشخصية لهذا الملف الشخصي.\nاتركه فارغا للإبقاء على افتراضي ${mode}.`,
@@ -2229,6 +2231,7 @@ export const ar = defineLocale({
       ownedByProfile: profile => `مملوكة للملف الشخصي ${profile}`,
       untitledChat: id => `محادثة ${id}`,
       handoffOrigin: platform => `قادمة من ${platform}`,
+      continuationOrigin: 'متابعة تلقائية — تم ضغط هذه المحادثة ومتابعتها',
       renamed: 'تمت إعادة التسمية',
       renameFailed: 'فشلت إعادة التسمية',
       renameTitle: 'إعادة تسمية الجلسة',
@@ -2441,6 +2444,7 @@ export const ar = defineLocale({
     goalWaiting: 'الهدف قيد الانتظار',
     subagents: count => `${count} ${count === 1 ? 'وكيل فرعي' : 'وكيل فرعي'}`,
     todos: (done, total) => `المهام ${done}/${total}`,
+    previousTodos: (done, total) => `المهام السابقة ${done}/${total}`,
     running: 'قيد التشغيل',
     stop: 'إيقاف',
     dismiss: 'تجاهل',
@@ -3259,6 +3263,8 @@ export const ar = defineLocale({
       preparingAudio: 'جار تجهيز الصوت',
       stopReading: 'إيقاف القراءة',
       readAloud: 'قراءة بصوت عال',
+      copyFullResponse: 'نسخ الرد الكامل',
+      readAloudFullResponseHint: 'انقر مع الضغط على Shift: قراءة الرد الكامل بصوت عال',
       editMessage: 'تحرير الرسالة',
       scrollToBottom: 'التمرير إلى الأسفل',
       stop: 'إيقاف',
