@@ -165,6 +165,7 @@ def _backend_dir_entries(search_dir: str, session_key: str | None) -> list[tuple
         'if [ -d "$p" ]; then printf "%s/\\n" "${p##*/}"; else printf "%s\\n" "${p##*/}"; fi; done'
     )
     try:
+        from hermes_cli.observability.shared_metrics_loop import unmetered_backend_calls
         from tools.terminal_tool import terminal_tool
         # Pre-confirm this internal read-only listing: its fixed `sh -c` script shape is
         # guard-flagged as "shell command via -c/-lc flag", so under smart approvals every
@@ -172,9 +173,10 @@ def _backend_dir_entries(search_dir: str, session_key: str | None) -> list[tuple
         # configured), and Desktop's ws reconnect loop turns that into model traffic from an
         # idle machine (#115478). The script is a constant and the search dir is quoted, so
         # nothing here needs an approval verdict.
-        result = json.loads(terminal_tool(
-            f"sh -c {shlex.quote(script)} sh {shlex.quote(search_dir)}", task_id=session_key, timeout=3,
-            force=True))
+        with unmetered_backend_calls():  # Hermes' own listing, not the user's backend work
+            result = json.loads(terminal_tool(
+                f"sh -c {shlex.quote(script)} sh {shlex.quote(search_dir)}", task_id=session_key, timeout=3,
+                force=True))
     except Exception:
         return []
     if result.get("error") or result.get("exit_code") not in (0, None):
@@ -286,7 +288,9 @@ def _(rid, params: dict) -> dict:
     from agent.skill_bundles import get_skill_bundles
     # Skill/bundle lookups are home- and cwd-keyed: bind the calling session's profile and workspace so
     # the popup offers the project-local skills ``command.dispatch`` accepts for that session (#114359).
-    with _session_home_scope(_sessions.get(params.get("session_id", "")), cwd=_completion_cwd(params)):
+    # A new-chat draft has no session yet: it names its rail-selected ``profile`` instead (#124651).
+    with _session_home_scope(_sessions.get(params.get("session_id", "")), cwd=_completion_cwd(params),
+                             profile=params.get("profile")):
         skill_commands, skill_bundles = dict(get_skill_commands()), dict(get_skill_bundles())
     completer = SlashCommandCompleter(
         skill_commands_provider=lambda: skill_commands, skill_bundles_provider=lambda: skill_bundles)
@@ -365,10 +369,15 @@ def _(rid, params: dict) -> dict:
     # Save the key to ~/.hermes/.env via the unified credential lifecycle so any stale config.yaml mirror of
     # the previous key (model.api_key, custom_providers[*].api_key) is rotated in the same action (#62269).
     env_var = pconfig.api_key_env_vars[0]
+    from hermes_cli.config import load_env
     from hermes_cli.credential_lifecycle import save_provider_env_credential  # also rotates stale config.yaml mirrors
+    previous = load_env().get(env_var)
     # Under the profile scope the save publishes into the addressed profile's secret scope (and the
     # shared os.environ only for the launch profile), so the refreshed inventory below sees it.
     save_provider_env_credential(env_var, api_key)
+    if api_key != previous:  # a same-key re-save connects nothing new
+        from hermes_cli.observability.shared_metrics_setup import record_provider_setup_done
+        record_provider_setup_done(_resolve_session_platform(), slug, background=True)
     # The launch profile's boot record may still say "nothing configured"; the gated picker's own chat
     # waits on setup.status, so the fresh key must move the record (+ setup.ready). reconcile_record
     # leaves it alone when the bound home is another profile's.
